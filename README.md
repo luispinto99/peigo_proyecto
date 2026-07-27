@@ -43,13 +43,17 @@ S3 (bucket: peigo)
 Glue Data Catalog: piloto_tarjetas_raw, piloto_tarjetas_trusted (consultables vía Athena)
 
 Glue Jobs (Python Shell):
-  - job_limpieza_piloto_tarjetas           raw -> trusted (limpieza + flags)
-  - glue_job_modelo_segmentacion           for_modelling -> models + resultado final
+  - job_limpieza_modelo_tarjetas       raw -> trusted (limpieza + flags de negocio)
+  - job_base_modelo_segmentacion       trusted -> for_modelling (features para segmentación)
+  - job_modelo_segmentacion            for_modelling -> models/ + for_modelling (entrena KMeans,
+                                        genera clientes_segmentados.parquet y modelo_segmentacion.pkl)
 
 Disponibilización: API Gateway (HTTP API) + Lambda
   - GET  /priorizacion?cliente_id=X   -> resultado precomputado (segmento/score de un cliente ya en la base)
   - POST /score                       -> inferencia en vivo con el modelo real (cliente nuevo, fuera del batch)
 ```
+**Nota:** el modelo de inferencia causal (evaluación del piloto, pregunta de negocio 1) se corrió **solo localmente** — no se portó a un Glue Job, ya que es un análisis puntual para validar el efecto del piloto, no un proceso que necesite correr de forma recurrente en producción.
+
 
 ## Cómo correr el proyecto
 
@@ -64,24 +68,46 @@ jupyter notebook exploracion_inicial.ipynb
 python scripts/local/01_pipeline.py
 
 # 3. Construcción de base + modelo causal (evalúa el piloto)
-python scripts/local/03_base_modelo.py
-python scripts/local/04_modelo_causal.py
+python scripts/local/02_pipeline_base_modelo1.py
+python scripts/local/03_modelo1_causal.py
 
 # 4. Construcción de base + modelo de segmentación (prioriza la siguiente ola)
-python scripts/local/05_base_segmentacion.py
-python scripts/local/06_segmentacion.py
+python scripts/local/04_pipeline_base_segmentacion.py
+python scripts/local/05_modelo_segmentacion.py
 ```
 
 ### AWS (producción)
+**Preparación de datos**
 1. Sube `data/raw/` a `s3://peigo/data/raw/<tabla>/<tabla>.parquet` (una subcarpeta por tabla).
-2. Corre el Glue Crawler sobre `raw/` para catalogarla.
+2. Corre un Glue Crawler sobre `raw/` para catalogarla (base de datos `piloto_tarjetas_raw`).
 3. Sube `scripts/aws/etl_utils.py` y `scripts/aws/glue_job_limpieza.py` a `s3://peigo/scripts/`.
-4. Crea y corre el Glue Job de limpieza (Python Shell, `--additional-python-modules pyarrow,s3fs,boto3`, `--extra-py-files` apuntando a `etl_utils.py`) → escribe `data/trusted/`.
-5. Corre un segundo Glue Crawler sobre `trusted/`.
-6. Corre el Glue Job de construcción de base (`--additional-python-modules pyarrow,s3fs,boto3`) → escribe `data/for_modelling/`.
-7. Corre el Glue Job del modelo de segmentación (agrega `scikit-learn,scipy` a los módulos) → escribe `models/modelo_segmentacion.pkl` y el resultado final segmentado.
-8. Despliega la Lambda (`scripts/aws/lambda_function.py`) con el layer administrado `AWSSDKPandas-Python<version>`, permisos de `s3:GetObject` sobre `data/for_modelling/*` y `models/*`.
-9. Conecta la Lambda a un API Gateway (HTTP API) con las rutas `GET /priorizacion` y `POST /score`.
+
+**Job 1 — `job_limpieza_modelo_tarjetas`** (raw → trusted)
+4. Crea el Glue Job (Python Shell), script apuntando a `glue_job_limpieza.py`.
+   - `--extra-py-files`: `s3://peigo/scripts/etl_utils.py`
+   - `--additional-python-modules`: `pyarrow,s3fs,boto3`
+   - Job parameters: `--bucket peigo`, `--raw_prefix data/raw`, `--trusted_prefix data/trusted`, `--reports_prefix data/trusted/_reports`
+5. Corre el job → limpia las 5 tablas, agrega los flags de negocio, escribe `data/trusted/`.
+6. (Opcional) Corre un segundo Glue Crawler sobre `trusted/` para poder consultarla también desde Athena.
+
+**Job 2 — `job_base_modelo_segmentacion`** (trusted → for_modelling)
+7. Sube `glue_job_base_segmentacion.py` a `s3://peigo/scripts/`.
+   - `--additional-python-modules`: `pyarrow,s3fs,boto3` 
+   - Job parameters: `--bucket peigo`, `--trusted_prefix data/trusted`, `--for_modelling_prefix data/for_modelling`
+8. Corre el job → construye `base_segmentacion.parquet` con las features (tasas mensuales, antigüedad, etc.).
+
+**Job 3 — `job_modelo_segmentacion`** (for_modelling → models + resultado final)
+9. Sube `glue_job_modelo_segmentacion.py` a `s3://peigo/scripts/`.
+   - `--additional-python-modules`: `pyarrow,s3fs,boto3,scikit-learn,scipy`
+   - Job parameters: `--bucket peigo`, `--for_modelling_prefix data/for_modelling`, `--models_prefix models`
+10. Corre el job → entrena el KMeans, arma el ranking de prioridad, y guarda `modelo_segmentacion.pkl` + `clientes_segmentados.parquet`.
+
+**Disponibilización**
+11. Despliega la Lambda (`scripts/aws/lambda_function.py`) con el layer administrado `AWSSDKPandas-Python<version>`, y un rol con `s3:GetObject` sobre `data/for_modelling/clientes_segmentados/*` y `models/*`.
+12. Crea un API Gateway (HTTP API), integración a la Lambda, con las rutas `GET /priorizacion` y `POST /score`, y despliega la etapa.
+
+**Nota:** el modelo de inferencia causal (`03_base_modelo.py` / `04_modelo_causal.py`) se corrió únicamente en local — no forma parte de los Glue Jobs, ya que responde una pregunta puntual de evaluación del piloto, no un proceso recurrente de producción.
+
 
 ## Problemas de calidad de datos encontrados y cómo se resolvieron
 
